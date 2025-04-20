@@ -46,7 +46,7 @@ A high-precision, agent-driven web crawler that uses LLM, MCP, and Fetch MCP to 
 3. Configure your MCP server and API keys as needed (see `fastagent.config.yaml`)
 4. Run the crawler (specify the root URL as an argument or interactively):
    ```bash
-   uv run agent.py https://fast-agent.ai/
+   uv run agent.py --message https://fast-agent.ai/
    ```
 5. The cleaned content will be saved to `site_crawl_result.md`
 
