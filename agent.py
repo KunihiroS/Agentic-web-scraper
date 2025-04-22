@@ -1,160 +1,211 @@
-import asyncio
-import requests
-import xml.etree.ElementTree as ET
+"""
+Agentic Web Scraper - Skeleton
+
+This file defines the overall workflow and agent skeletons for the redesigned architecture.
+"""
+
 import sys
+import asyncio
 from mcp_agent.core.fastagent import FastAgent
-from mcp_agent.core.direct_decorators import agent
+from typing import List
 
-fast = FastAgent("SiteMapCrawler")
+fast = FastAgent("AgenticWebScraper")
 
-def fetch_sitemap_urls(sitemap_url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
-    }
-    try:
-        response = requests.get(sitemap_url, headers=headers)
-        print(f"[DEBUG] Fetched: {sitemap_url} (status: {response.status_code})")
-        if response.status_code != 200:
-            print("[WARN] sitemap.xml not found or not 200. Fallback to link extraction.")
-            return None
-        namespace = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        root = ET.fromstring(response.content)
-        urls = [loc.text for loc in root.findall('.//ns:loc', namespace) if loc.text]
-        print(f"[DEBUG] Extracted {len(urls)} URLs. First 10: {urls[:10]}")
-        return urls
-    except Exception as e:
-        print(f"[ERROR] sitemap.xml parse error: {e}")
-        return None
+# === 1. 初期入力・設定 ===
+def get_root_url():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    return input("Enter the root URL (e.g. https://fast-agent.ai/): ").strip()
 
-async def extract_links_from_html_async(url):
-    from playwright.async_api import async_playwright
+# === 2. URLリスト抽出 (sitemap/Playwright) ===
+def extract_url_list(root_url):
+    """
+    指定されたroot_urlからsitemap.xmlを探して全URLを抽出します。
+    sitemapがなければPlaywrightでページ内のaタグリンクを抽出します。
+    """
+    import requests
     from bs4 import BeautifulSoup
-    links = set()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-            viewport={"width": 1280, "height": 720}
-        )
-        page = await context.new_page()
-        await page.goto(url, wait_until="networkidle")
-        html = await page.content()
-        await browser.close()
-        soup = BeautifulSoup(html, "html.parser")
-        anchors = soup.find_all("a", href=True)
-        total_anchors = len(anchors)
-        for index, a in enumerate(anchors, start=1):
-            href = a["href"]
-            if href.startswith("http"):
-                links.add(href)
-            elif href.startswith("/"):
-                from urllib.parse import urljoin
-                links.add(urljoin(url, href))
-            print(f"[PROGRESS] Processing links: {index}/{total_anchors} ({(index/total_anchors)*100:.2f}%)")
-    print(f"[DEBUG] Playwright-extracted {len(links)} links from HTML. First 10: {list(links)[:10]}")
-    return list(links)
+    from urllib.parse import urljoin, urlparse
+    import re
+    import os
+    
+    # 1. sitemap.xmlの自動検出
+    parsed = urlparse(root_url)
+    sitemap_url = urljoin(f"{parsed.scheme}://{parsed.netloc}", "/sitemap.xml")
+    urls = []
+    try:
+        resp = requests.get(sitemap_url, timeout=10)
+        if resp.status_code == 200 and '<urlset' in resp.text:
+            soup = BeautifulSoup(resp.text, "xml")
+            urls = [loc.text.strip() for loc in soup.find_all("loc") if loc.text.strip()]
+            if urls:
+                return urls
+    except Exception as e:
+        pass  # sitemap取得失敗は無視
+    
+    # 2. Playwrightでrootページからaタグリンクを抽出
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(root_url, timeout=15000)
+            anchors = page.query_selector_all("a")
+            links = set()
+            for a in anchors:
+                href = a.get_attribute("href")
+                if href and not href.startswith("#"):
+                    abs_url = urljoin(root_url, href)
+                    # 同一ドメインのみ
+                    if urlparse(abs_url).netloc == parsed.netloc:
+                        links.add(abs_url.split("#")[0])
+            browser.close()
+            if links:
+                return sorted(links)
+    except Exception as e:
+        pass  # Playwright失敗も無視
+    
+    # 失敗時はroot_urlのみ返す
+    return [root_url]
 
+# === 3. 作業量見積もり・表示 ===
+def estimate_and_show_work(urls):
+    """
+    URLリストの件数・サンプル・簡易見積もり（トークン/時間）を表示する
+    """
+    num = len(urls)
+    print(f"\n=== 対象URL件数: {num}件 ===")
+    if num == 0:
+        print("URLリストが空です。終了します。")
+        return
+    # サンプル表示（最大5件）
+    print("サンプルURL:")
+    for url in urls[:5]:
+        print(f"  - {url}")
+    if num > 5:
+        print(f"  ... 他{num-5}件")
+    
+    # 簡易トークン・時間見積もり
+    avg_token = 2000  # 1ページあたり想定トークン数
+    avg_sec = 5      # 1ページあたり想定処理秒数
+    total_token = num * avg_token
+    total_sec = num * avg_sec
+    print(f"\n見積もり: 合計 {total_token:,} tokens, 約 {total_sec//60}分{total_sec%60}秒")
+
+# === 4. ユーザーによる実行可否決定 (y/n/t) ===
+def get_user_decision():
+    """
+    ユーザーに対して実行可否を尋ねる。
+    y: 全件実行, n: 実行先URLの優先順を提案して範囲選択, t: 終了
+    """
+    while True:
+        ans = input("\n実行しますか？ [y]全件実行 [n]提案と範囲選択 [t]終了 : ").strip().lower()
+        if ans in ("y", "n", "t"):
+            return ans
+        print("y, n, t のいずれかを入力してください。")
+
+# === 5. LLMエージェント: ページスクレイプ (Fetch MCP) ===
 @fast.agent(
-    "link_extractor_agent",
-    instruction="Given the raw HTML of a web page, extract all unique internal links (absolute URLs within the same domain) that are likely to be important for crawling (e.g., documentation, guides, API, tutorials, etc). Return a Python list of URLs as strings. Do not include navigation, footer, or external links."
-)
-async def link_extractor_agent(agent, html: str, base_url: str):
-    pass
-
-@fast.agent(
-    "metrics_generator_agent",
-    instruction="Given the full content of a website's root page (Markdown or HTML), extract a list of important page types, categories, or features that should be prioritized for crawling (e.g., API reference, documentation, tutorials, release notes, etc). Return a Python list of keywords or patterns that can be used to evaluate the importance of URLs in the sitemap."
-)
-async def metrics_generator_agent(agent, root_content: str):
-    pass
-
-def url_evaluator_agent(urls, metrics):
-    results = []
-    for url in urls:
-        score = "LOW"
-        for kw in metrics:
-            if kw.lower() in url.lower():
-                score = "HIGH"
-                break
-        results.append({"url": url, "score": score})
-    print(f"[DEBUG] url_evaluator_agent: {sum(1 for r in results if r['score']=='HIGH')} HIGH, {sum(1 for r in results if r['score']=='LOW')} LOW")
-    return results
-
-@fast.agent(
-    "content_fetcher_agent",
-    instruction="Fetch the content of the given URL as Markdown using Fetch MCP. If raw_html is True, fetch the raw HTML instead.",
+    name="page_scraper",
+    instruction="Fetch the content of the given URL as Markdown using Fetch MCP.",
     servers=["fetch"]
 )
-async def content_fetcher_agent(agent, url: str, raw_html: bool = False):
-    try:
-        if raw_html:
-            content = await agent.mcp.fetch.fetch_markdown(url=url, raw=True, max_length=100000)
-        else:
-            content = await agent.mcp.fetch.fetch_markdown(url=url, max_length=100000)
-        if isinstance(content, str):
-            return content
-        else:
-            return "[ERROR] fetch_markdown did not return string"
-    except Exception as e:
-        return f"[ERROR] Exception: {e}"
+async def page_scraper(agent, url: str):
+    # Fetch MCP Server経由でページ取得（本実装）
+    # MCPサーバーがMarkdownで返す前提
+    response = await agent.call_mcp_server("fetch", url=url)
+    # 返り値がdictの場合を想定（例: {"markdown": ...}）
+    if isinstance(response, dict) and "markdown" in response:
+        return {"url": url, "markdown": response["markdown"]}
+    # 返り値が文字列の場合（Markdownそのもの）
+    elif isinstance(response, str):
+        return {"url": url, "markdown": response}
+    else:
+        raise ValueError(f"MCP fetch server returned unexpected response: {response}")
 
+# === 5b. LLMエージェント: ノイズ除去 ===
 @fast.agent(
-    "content_cleaner_agent",
-    instruction="Given the Markdown content of a web page, remove navigation, footer, sidebar, ads, duplicated explanations, and error messages. Do NOT summarize or rewrite the content, just remove obvious noise and keep the main text as Markdown. Return only the cleaned Markdown."
+    name="content_cleaner",
+    instruction="Remove navigation, ads, and noise from Markdown content. Return cleaned Markdown."
 )
-async def content_cleaner_agent(agent, markdown: str):
+async def content_cleaner(agent, markdown: str):
+    # Fetch MCP Server経由でノイズ除去（本実装）
+    response = await agent.call_mcp_server("clean", markdown=markdown)
+    # 返り値がdictの場合を想定（例: {"markdown": ...}）
+    if isinstance(response, dict) and "markdown" in response:
+        return response["markdown"]
+    # 返り値が文字列の場合（Markdownそのもの）
+    elif isinstance(response, str):
+        return response
+    else:
+        raise ValueError(f"MCP clean server returned unexpected response: {response}")
+
+# === 5c. 並列スクレイピング＆ノイズ除去 (asyncio) ===
+async def parallel_scrape_and_clean(agent, urls: List[str]):
+    async def scrape_and_clean(url):
+        page = await agent.page_scraper(url)
+        cleaned = await agent.content_cleaner(page["markdown"])
+        return {"url": url, "markdown": cleaned}
+    return await asyncio.gather(*(scrape_and_clean(url) for url in urls))
+
+# === 6. LLMエージェント: 優先度付け/理由説明 ===
+@fast.agent(
+    name="prioritizer",
+    instruction="Given a root page context and a list of URLs, return a prioritized list with reasons."
+)
+async def prioritizer(agent, context: str, url_list: list):
+    # TODO: LLMで優先度付け・理由生成
     pass
 
-def save_crawled_content(contents, filename="site_crawl_result.md"):
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(contents))
-    print(f"[INFO] Saved {len(contents)} pages to {filename}")
+# === 7. ユーザー: 番号で範囲決定 ===
+def get_user_url_range():
+    # (実装: 番号で範囲指定)
+    # TODO: 実装
+    return 0, 0
 
+# === 8. LLMエージェント: クロール実行・進捗管理 ===
+@fast.agent(
+    name="crawler",
+    instruction="Crawl the selected URLs and manage progress, returning cleaned Markdown.",
+    servers=["fetch"]
+)
+async def crawler(agent, urls: list):
+    # 並列スクレイピング＆ノイズ除去
+    results = await parallel_scrape_and_clean(agent, urls)
+    # 結果を集約（URLとcleaned markdownのリスト）
+    return results
+
+# === 9. Python: 保存・エラー/レジューム ===
+def save_results():
+    # (実装: Markdown保存・エラー/レジューム管理)
+    # TODO: 実装
+    pass
+
+# === メインワークフロー ===
 async def main():
-    if len(sys.argv) > 1:
-        root_url = sys.argv[1]
-    else:
-        root_url = input("Enter the root URL (e.g. https://fast-agent.ai/): ").strip()
-    if not root_url.startswith("http"):
-        print("Please provide a valid URL (e.g. https://example.com/)")
+    root_url = get_root_url()
+    url_list = extract_url_list(root_url)
+    estimate_and_show_work(url_list)
+    decision = get_user_decision()
+    if decision == "t":
+        print("Terminated by user.")
         return
-    sitemap_url = root_url.rstrip("/") + "/sitemap.xml"
-    urls = fetch_sitemap_urls(sitemap_url)
     async with fast.run() as agent:
-        if urls is None:
-            print("[INFO] sitemap.xml not found. Falling back to Playwright-based HTML link extraction.")
-            urls = await extract_links_from_html_async(root_url)
-            print(f"[DEBUG] Playwright-extracted {len(urls)} links. First 10: {urls[:10] if urls else []}")
-        print(f"[INFO] Fetching root page: {root_url}")
-        root_content = await agent.content_fetcher_agent(root_url)
-        print(f"[INFO] Generating evaluation metrics from root page content...")
-        metrics = await agent.metrics_generator_agent(root_content)
-        print(f"[INFO] Metrics generated: {metrics}")
-        evaluated = url_evaluator_agent(urls, metrics)
-        import hashlib
-        target_urls = [r["url"] for r in evaluated if r["score"] == "HIGH"]
-        print(f"[INFO] Fetching and cleaning content for {len(target_urls)} URLs via Fetch MCP + LLM...")
-        contents = []
-        total_urls = len(target_urls)
-        # root_urlをハッシュ化してファイル名に含める
-        url_hash = hashlib.sha256(root_url.encode("utf-8")).hexdigest()[:10]
-        resume_file = f"last_processed_index_{url_hash}.txt"
-        start_index = 0  # デフォルトの開始インデックス
-        try:
-            with open(resume_file, "r") as f:
-                start_index = int(f.read().strip())
-                print(f"[INFO] Resuming from index {start_index + 1}")
-        except FileNotFoundError:
-            pass
-        for index, url in enumerate(target_urls[start_index:], start=start_index + 1):
-            print(f"[INFO] Processing URL {index}/{total_urls}: {url}")
-            markdown = await agent.content_fetcher_agent(url)
-            cleaned = await agent.content_cleaner_agent(markdown)
-            contents.append(f"# {url}\n\n{cleaned}\n")
-            print(f"[PROGRESS] {index}/{total_urls} URLs processed ({(index/total_urls)*100:.2f}%)")
-            with open(resume_file, "w") as f:
-                f.write(str(index))
-    save_crawled_content(contents)
+        if decision == "y":
+            # 全件対象
+            selected_urls = url_list
+        elif decision == "n":
+            # rootページのスクレイプ・ノイズ除去・優先度付け・範囲選択
+            root_page = await agent.page_scraper(root_url)
+            cleaned_root = await agent.content_cleaner(root_page["markdown"])
+            prioritized = await agent.prioritizer(cleaned_root, url_list)
+            start, end = get_user_url_range()
+            selected_urls = prioritized[start:end+1]
+        else:
+            print("Invalid input. Terminating.")
+            return
+        await agent.crawler(selected_urls)
+    save_results()
 
 if __name__ == "__main__":
     asyncio.run(main())
